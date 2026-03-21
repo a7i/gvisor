@@ -4,6 +4,9 @@ name: CI
   push:
     branches:
       - "*"
+    tags:
+      - "*"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -11,10 +14,19 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            bazel_config: x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            bazel_config: aarch64
+    runs-on: ${{ matrix.runner }}
 
     steps:
-    - name: bazel
+    - name: Install build tools
       run: |
         export DEBIAN_FRONTEND=noninteractive
         sudo -E apt update && sudo -E apt install -y make
@@ -22,13 +34,56 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v5
 
-    - name: build
+    - name: Build runsc
       run: |
-          mkdir -p bin
-          make copy TARGETS=runsc DESTINATION=bin/
+        mkdir -p bin
+        make copy TARGETS=runsc DESTINATION=bin/
 
-    - name: Upload runsc
+    - name: Build containerd-shim-runsc-v1
+      run: |
+        make copy TARGETS="//shim:containerd-shim-runsc-v1" DESTINATION=bin/
+
+    - name: Generate checksums
+      run: |
+        cd bin
+        sha512sum runsc > runsc.sha512
+        sha512sum containerd-shim-runsc-v1 > containerd-shim-runsc-v1.sha512
+
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-          name: runsc
-          path: bin/runsc
+        name: gvisor-${{ matrix.arch }}
+        path: |
+          bin/runsc
+          bin/runsc.sha512
+          bin/containerd-shim-runsc-v1
+          bin/containerd-shim-runsc-v1.sha512
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release
+        for arch in x86_64 aarch64; do
+          for f in artifacts/gvisor-${arch}/*; do
+            base=$(basename "$f")
+            cp "$f" "release/${base}-${arch}"
+          done
+        done
+        ls -lh release/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release/*
+        generate_release_notes: true
