@@ -1,0 +1,69 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "release-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            bazel_config: ""
+          - arch: aarch64
+            bazel_config: "--config=aarch64"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -E apt-get update
+          sudo -E apt-get install -y make
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build runsc
+        run: |
+          mkdir -p bin
+          make copy TARGETS="//runsc" OPTIONS="${{ matrix.bazel_config }}" DESTINATION=bin/
+          mv bin/runsc bin/runsc-${{ matrix.arch }}
+
+      - name: Build containerd-shim-runsc-v1
+        run: |
+          make copy TARGETS="//shim:containerd-shim-runsc-v1" OPTIONS="${{ matrix.bazel_config }}" DESTINATION=bin/
+          mv bin/containerd-shim-runsc-v1 bin/containerd-shim-runsc-v1-${{ matrix.arch }}
+
+      - name: Generate SHA512 checksums
+        working-directory: bin
+        run: |
+          sha512sum runsc-${{ matrix.arch }} > runsc.sha512-${{ matrix.arch }}
+          sha512sum containerd-shim-runsc-v1-${{ matrix.arch }} > containerd-shim-runsc-v1.sha512-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: bin/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
