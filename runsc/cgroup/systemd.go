@@ -92,6 +92,33 @@ func newCgroupV2Systemd(cgv2 *cgroupV2) (*cgroupSystemd, error) {
 	return cg, err
 }
 
+// installCompatDir creates the cgroup directory under the parent slice
+// without registering a transient systemd unit, and tracks it in c.Own so
+// the embedded cgroupV2.Uninstall removes it at container destroy.
+//
+// This exists so tools that discover containers via inotify on
+// /sys/fs/cgroup (notably cAdvisor) can see subcontainers that run inside a
+// gVisor sandbox and therefore have no real cgroup placement of their own.
+// Install() on systemd v2 only stages dbus properties; the cgroup directory
+// is otherwise created by Join() via StartTransientUnit, which would
+// inappropriately register a process-less unit for compat purposes.
+//
+// Callers should use this in place of Install(empty resources) when they
+// only need the host-side cgroup directory to exist for compatibility.
+func (c *cgroupSystemd) installCompatDir() error {
+	path := c.MakePath("")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("creating compat cgroup dir %q: %w", path, err)
+	}
+	for _, owned := range c.Own {
+		if owned == path {
+			return nil
+		}
+	}
+	c.Own = append(c.Own, path)
+	return nil
+}
+
 // Install configures the properties for a scope unit but does not start the
 // unit.
 func (c *cgroupSystemd) Install(res *specs.LinuxResources) error {

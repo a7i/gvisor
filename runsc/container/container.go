@@ -1961,8 +1961,23 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 	if cg == nil || err != nil {
 		return nil, err
 	}
-	// Use empty resources, just want the directory structure created.
-	return cgroupInstall(conf, cg, &specs.LinuxResources{})
+	// Just want the directory structure created so cAdvisor (and other
+	// inotify-based tools) can discover the subcontainer. On systemd v2,
+	// Install({}) is a no-op for directory creation -- the dir is otherwise
+	// only created in Join() via StartTransientUnit, which would
+	// inappropriately register a process-less unit for compat purposes.
+	// InstallSubcontainerCompatDir handles that case while preserving the
+	// existing cgroupfs (v1 / non-systemd v2) behavior.
+	if err := cgroup.InstallSubcontainerCompatDir(cg); err != nil {
+		switch {
+		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
+			log.Warningf("Skipping subcontainer cgroup configuration in rootless mode: %v", err)
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("configuring subcontainer cgroup: %v", err)
+		}
+	}
+	return cg, nil
 }
 
 // cgroupInstall creates cgroups dir structure and sets their respective

@@ -18,6 +18,8 @@ package cgroup
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
@@ -266,6 +268,101 @@ func TestInstall(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestInstallCompatDir verifies that installCompatDir creates the cgroup
+// directory at the resolved scope path under the parent slice (so cAdvisor
+// can discover it via inotify), and that the embedded cgroupV2.Uninstall
+// removes it via the c.Own bookkeeping. This is the cgroup v2 + systemd
+// counterpart of #6500 / PR #6657, which created cAdvisor compat
+// directories on cgroup v1.
+func TestInstallCompatDir(t *testing.T) {
+	mountpoint := t.TempDir()
+	// Pre-create the parent slice path (mirrors what kubelet+systemd do on
+	// a real host) so that installCompatDir only has to create the leaf
+	// scope directory under it.
+	parentSlicePath := filepath.Join(mountpoint, "/parent.slice")
+	if err := os.MkdirAll(parentSlicePath, 0o755); err != nil {
+		t.Fatalf("mkdir parent slice: %v", err)
+	}
+
+	cg := &cgroupSystemd{
+		Name:        "abc",
+		ScopePrefix: "cri-containerd",
+		Parent:      "parent.slice",
+		cgroupV2: cgroupV2{
+			Mountpoint: mountpoint,
+			// Path is set by newCgroupV2Systemd to expanded slice + unitName.
+			Path: filepath.Join(expandSlice("parent.slice"), "cri-containerd-abc.scope"),
+		},
+	}
+
+	wantDir := cg.MakePath("")
+	if got, want := wantDir, filepath.Join(mountpoint, "/parent.slice", "cri-containerd-abc.scope"); got != want {
+		t.Fatalf("MakePath() = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(wantDir); !os.IsNotExist(err) {
+		t.Fatalf("compat dir already exists or unexpected error before install: %v", err)
+	}
+
+	if err := cg.installCompatDir(); err != nil {
+		t.Fatalf("installCompatDir() error: %v", err)
+	}
+	info, err := os.Stat(wantDir)
+	if err != nil {
+		t.Fatalf("compat dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("compat dir %q is not a directory", wantDir)
+	}
+	// The path must be tracked in Own so Uninstall can clean it up.
+	if got := len(cg.Own); got != 1 || cg.Own[0] != wantDir {
+		t.Fatalf("c.Own = %v, want exactly [%q]", cg.Own, wantDir)
+	}
+
+	// Idempotency: calling again on an existing dir should not error and
+	// should not double-track the path (avoid leaking entries on retries).
+	if err := cg.installCompatDir(); err != nil {
+		t.Fatalf("installCompatDir() second call error: %v", err)
+	}
+	if got := len(cg.Own); got != 1 {
+		t.Fatalf("len(c.Own) after second installCompatDir = %d, want 1", got)
+	}
+
+	// Uninstall must remove the dir we created.
+	if err := cg.Uninstall(); err != nil {
+		t.Fatalf("Uninstall() error: %v", err)
+	}
+	if _, err := os.Stat(wantDir); !os.IsNotExist(err) {
+		t.Fatalf("compat dir still exists after Uninstall: %v", err)
+	}
+}
+
+// TestInstallSubcontainerCompatDirSystemd verifies the public dispatcher
+// routes systemd cgroups to installCompatDir (not the dbus Install path).
+func TestInstallSubcontainerCompatDirSystemd(t *testing.T) {
+	mountpoint := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mountpoint, "parent.slice"), 0o755); err != nil {
+		t.Fatalf("mkdir parent slice: %v", err)
+	}
+	cg := &cgroupSystemd{
+		Name:        "abc",
+		ScopePrefix: "cri-containerd",
+		Parent:      "parent.slice",
+		cgroupV2: cgroupV2{
+			Mountpoint: mountpoint,
+			Path:       filepath.Join(expandSlice("parent.slice"), "cri-containerd-abc.scope"),
+		},
+	}
+	if err := InstallSubcontainerCompatDir(cg); err != nil {
+		t.Fatalf("InstallSubcontainerCompatDir(systemd) error: %v", err)
+	}
+	if _, err := os.Stat(cg.MakePath("")); err != nil {
+		t.Fatalf("compat dir not created via InstallSubcontainerCompatDir: %v", err)
+	}
+	if err := cg.Uninstall(); err != nil {
+		t.Fatalf("Uninstall() error: %v", err)
 	}
 }
 

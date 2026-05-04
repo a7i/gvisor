@@ -430,6 +430,22 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 	return cg, nil
 }
 
+// InstallSubcontainerCompatDir creates an empty cgroup directory at the path
+// resolved by cg, intended for cAdvisor (and other inotify-based) discovery
+// of subcontainers running inside a gVisor sandbox. The directory is tracked
+// by cg so that cg.Uninstall() removes it at container destroy.
+//
+// On systemd v2, this bypasses the dbus StartTransientUnit path: a
+// process-less transient unit is not necessary for inotify discovery and
+// causes lifecycle conflicts with systemd. On cgroupfs (v1 or non-systemd v2),
+// this delegates to Install({}) which already mkdirs the directory.
+func InstallSubcontainerCompatDir(cg Cgroup) error {
+	if sd, ok := cg.(*cgroupSystemd); ok {
+		return sd.installCompatDir()
+	}
+	return cg.Install(&specs.LinuxResources{})
+}
+
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
 type CgroupJSON struct {
 	Cgroup Cgroup
