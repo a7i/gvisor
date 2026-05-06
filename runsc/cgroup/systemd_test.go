@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
@@ -271,22 +272,17 @@ func TestInstall(t *testing.T) {
 	}
 }
 
-// TestInstallCompatDir verifies that installCompatDir creates the cgroup
-// directory at the resolved scope path under the parent slice (so cAdvisor
-// can discover it via inotify), and that the embedded cgroupV2.Uninstall
-// removes it via the c.Own bookkeeping. This is the cgroup v2 + systemd
-// counterpart of #6500 / PR #6657, which created cAdvisor compat
-// directories on cgroup v1.
-func TestInstallCompatDir(t *testing.T) {
+// newCompatDirTestCgroup constructs a cgroupSystemd anchored at a temporary
+// mountpoint with its parent slice pre-created, mirroring what kubelet+systemd
+// arrange on a real host. The leaf scope directory itself is intentionally
+// not created -- installCompatDir is the unit under test for that.
+func newCompatDirTestCgroup(t *testing.T) (*cgroupSystemd, string) {
+	t.Helper()
 	mountpoint := t.TempDir()
-	// Pre-create the parent slice path (mirrors what kubelet+systemd do on
-	// a real host) so that installCompatDir only has to create the leaf
-	// scope directory under it.
 	parentSlicePath := filepath.Join(mountpoint, "/parent.slice")
 	if err := os.MkdirAll(parentSlicePath, 0o755); err != nil {
 		t.Fatalf("mkdir parent slice: %v", err)
 	}
-
 	cg := &cgroupSystemd{
 		Name:        "abc",
 		ScopePrefix: "cri-containerd",
@@ -297,17 +293,57 @@ func TestInstallCompatDir(t *testing.T) {
 			Path: filepath.Join(expandSlice("parent.slice"), "cri-containerd-abc.scope"),
 		},
 	}
+	return cg, cg.MakePath("")
+}
 
-	wantDir := cg.MakePath("")
-	if got, want := wantDir, filepath.Join(mountpoint, "/parent.slice", "cri-containerd-abc.scope"); got != want {
+// seedCompatLeafFiles touches the v2 controller interface files in the leaf
+// scope directory that the kernel would auto-create on a real cgroupfs mount
+// when the corresponding controllers are enabled in the parent's
+// cgroup.subtree_control. Without these, setValue (which uses O_WRONLY|
+// O_TRUNC and does not create) returns ENOENT, which is the
+// controller-not-enabled path.
+func seedCompatLeafFiles(t *testing.T, leafDir string, names ...string) {
+	t.Helper()
+	if err := os.MkdirAll(leafDir, 0o755); err != nil {
+		t.Fatalf("mkdir leaf dir: %v", err)
+	}
+	for _, name := range names {
+		f, err := os.Create(filepath.Join(leafDir, name))
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		f.Close()
+	}
+}
+
+// readCgroupFile reads a single cgroup interface file under leafDir and
+// returns its trimmed contents.
+func readCgroupFile(t *testing.T, leafDir, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(leafDir, name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
+}
+
+// TestInstallCompatDir verifies that installCompatDir creates the cgroup
+// directory at the resolved scope path under the parent slice (so cAdvisor
+// can discover it via inotify), and that the embedded cgroupV2.Uninstall
+// removes it via the c.Own bookkeeping. This is the cgroup v2 + systemd
+// counterpart of #6500 / PR #6657, which created cAdvisor compat
+// directories on cgroup v1.
+func TestInstallCompatDir(t *testing.T) {
+	cg, wantDir := newCompatDirTestCgroup(t)
+	if got, want := wantDir, filepath.Join(cg.Mountpoint, "/parent.slice", "cri-containerd-abc.scope"); got != want {
 		t.Fatalf("MakePath() = %q, want %q", got, want)
 	}
 	if _, err := os.Stat(wantDir); !os.IsNotExist(err) {
 		t.Fatalf("compat dir already exists or unexpected error before install: %v", err)
 	}
 
-	if err := cg.installCompatDir(); err != nil {
-		t.Fatalf("installCompatDir() error: %v", err)
+	if err := cg.installCompatDir(nil); err != nil {
+		t.Fatalf("installCompatDir(nil) error: %v", err)
 	}
 	info, err := os.Stat(wantDir)
 	if err != nil {
@@ -323,8 +359,8 @@ func TestInstallCompatDir(t *testing.T) {
 
 	// Idempotency: calling again on an existing dir should not error and
 	// should not double-track the path (avoid leaking entries on retries).
-	if err := cg.installCompatDir(); err != nil {
-		t.Fatalf("installCompatDir() second call error: %v", err)
+	if err := cg.installCompatDir(nil); err != nil {
+		t.Fatalf("installCompatDir(nil) second call error: %v", err)
 	}
 	if got := len(cg.Own); got != 1 {
 		t.Fatalf("len(c.Own) after second installCompatDir = %d, want 1", got)
@@ -339,30 +375,121 @@ func TestInstallCompatDir(t *testing.T) {
 	}
 }
 
-// TestInstallSubcontainerCompatDirSystemd verifies the public dispatcher
-// routes systemd cgroups to installCompatDir (not the dbus Install path).
-func TestInstallSubcontainerCompatDirSystemd(t *testing.T) {
-	mountpoint := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(mountpoint, "parent.slice"), 0o755); err != nil {
-		t.Fatalf("mkdir parent slice: %v", err)
-	}
-	cg := &cgroupSystemd{
-		Name:        "abc",
-		ScopePrefix: "cri-containerd",
-		Parent:      "parent.slice",
-		cgroupV2: cgroupV2{
-			Mountpoint: mountpoint,
-			Path:       filepath.Join(expandSlice("parent.slice"), "cri-containerd-abc.scope"),
+// TestInstallCompatDirSpecFiles verifies that installCompatDir populates the
+// cgroup interface files cAdvisor reads as container_spec_* (memory.max,
+// cpu.max, cpu.weight, pids.max, memory.swap.max) when handed a non-nil
+// LinuxResources. The leaf interface files are pre-touched to simulate what
+// the kernel auto-creates when the corresponding controllers are enabled in
+// the parent slice's cgroup.subtree_control on a real cgroupfs mount.
+func TestInstallCompatDirSpecFiles(t *testing.T) {
+	cg, leafDir := newCompatDirTestCgroup(t)
+	seedCompatLeafFiles(t, leafDir,
+		"memory.max", "memory.swap.max", "memory.low",
+		"cpu.max", "cpu.weight",
+		"pids.max",
+	)
+
+	memLimit := int64(536870912)            // 512 MiB
+	memSwap := int64(1073741824)            // 1 GiB combined memory+swap (runc-style)
+	cpuQuota := int64(50000)
+	cpuPeriod := uint64(100000)
+	cpuShares := uint64(2048)
+	pidsLimit := int64(100)
+	res := &specs.LinuxResources{
+		Memory: &specs.LinuxMemory{
+			Limit: &memLimit,
+			Swap:  &memSwap,
+		},
+		CPU: &specs.LinuxCPU{
+			Quota:  &cpuQuota,
+			Period: &cpuPeriod,
+			Shares: &cpuShares,
+		},
+		Pids: &specs.LinuxPids{
+			Limit: pidsLimit,
 		},
 	}
-	if err := InstallSubcontainerCompatDir(cg); err != nil {
-		t.Fatalf("InstallSubcontainerCompatDir(systemd) error: %v", err)
+	if err := cg.installCompatDir(res); err != nil {
+		t.Fatalf("installCompatDir(res) error: %v", err)
 	}
-	if _, err := os.Stat(cg.MakePath("")); err != nil {
+
+	if got, want := readCgroupFile(t, leafDir, "memory.max"), "536870912"; got != want {
+		t.Errorf("memory.max = %q, want %q", got, want)
+	}
+	// Swap in v2 is the swap-only value (memorySwap - memory).
+	if got, want := readCgroupFile(t, leafDir, "memory.swap.max"), "536870912"; got != want {
+		t.Errorf("memory.swap.max = %q, want %q", got, want)
+	}
+	if got, want := readCgroupFile(t, leafDir, "cpu.max"), "50000 100000"; got != want {
+		t.Errorf("cpu.max = %q, want %q", got, want)
+	}
+	// cpu.shares=2048 maps to cpu.weight via the runc-compatible formula.
+	wantWeight := strconv.FormatUint(convertCPUSharesToCgroupV2Value(cpuShares), 10)
+	if got := readCgroupFile(t, leafDir, "cpu.weight"); got != wantWeight {
+		t.Errorf("cpu.weight = %q, want %q", got, wantWeight)
+	}
+	if got, want := readCgroupFile(t, leafDir, "pids.max"), "100"; got != want {
+		t.Errorf("pids.max = %q, want %q", got, want)
+	}
+}
+
+// TestInstallCompatDirBestEffort verifies installCompatDir is best-effort:
+// when controller interface files are absent (controller not enabled in the
+// parent slice's cgroup.subtree_control on a real host), the missing-file
+// errors from setValue are swallowed, the directory is still created, and
+// installCompatDir returns success. This preserves the #6657 invariant that
+// the compat path must never block container start.
+func TestInstallCompatDirBestEffort(t *testing.T) {
+	cg, leafDir := newCompatDirTestCgroup(t)
+
+	memLimit := int64(536870912)
+	res := &specs.LinuxResources{
+		Memory: &specs.LinuxMemory{Limit: &memLimit},
+	}
+
+	// Deliberately do NOT seed any leaf interface files. set() will hit
+	// ENOENT for every controller it tries to write; installCompatDir must
+	// swallow that and still report success.
+	if err := cg.installCompatDir(res); err != nil {
+		t.Fatalf("installCompatDir(res) with no leaf files: got error %v, want nil (best-effort)", err)
+	}
+	if _, err := os.Stat(leafDir); err != nil {
+		t.Fatalf("compat dir not created: %v", err)
+	}
+	if got := len(cg.Own); got != 1 || cg.Own[0] != leafDir {
+		t.Fatalf("c.Own = %v, want exactly [%q]", cg.Own, leafDir)
+	}
+}
+
+// TestInstallSubcontainerCompatDirSystemd verifies the public dispatcher
+// routes systemd cgroups to installCompatDir (not the dbus Install path),
+// and that resources flow through to spec-file population on the leaf.
+//
+// Uninstall() is exercised by TestInstallCompatDir (with no spec files
+// written, so unix.Rmdir succeeds on the empty leaf). It is intentionally
+// not exercised here: on a real cgroupfs mount the kernel atomically
+// removes the auto-generated interface files when rmdir-ing an empty cgroup
+// directory, but in a regular tmpdir the spec files we wrote are real files
+// that block rmdir. That's a test-environment artifact, not a behavior
+// difference we should encode in production code.
+func TestInstallSubcontainerCompatDirSystemd(t *testing.T) {
+	cg, leafDir := newCompatDirTestCgroup(t)
+	// Pre-create only memory.max so we can assert end-to-end that resources
+	// passed via the dispatcher reach the per-controller set() methods.
+	seedCompatLeafFiles(t, leafDir, "memory.max")
+
+	memLimit := int64(123456789)
+	res := &specs.LinuxResources{
+		Memory: &specs.LinuxMemory{Limit: &memLimit},
+	}
+	if err := InstallSubcontainerCompatDir(cg, res); err != nil {
+		t.Fatalf("InstallSubcontainerCompatDir(systemd, res) error: %v", err)
+	}
+	if _, err := os.Stat(leafDir); err != nil {
 		t.Fatalf("compat dir not created via InstallSubcontainerCompatDir: %v", err)
 	}
-	if err := cg.Uninstall(); err != nil {
-		t.Fatalf("Uninstall() error: %v", err)
+	if got, want := readCgroupFile(t, leafDir, "memory.max"), "123456789"; got != want {
+		t.Errorf("memory.max = %q, want %q", got, want)
 	}
 }
 

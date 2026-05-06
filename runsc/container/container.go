@@ -1961,14 +1961,18 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 	if cg == nil || err != nil {
 		return nil, err
 	}
-	// Just want the directory structure created so cAdvisor (and other
-	// inotify-based tools) can discover the subcontainer. On systemd v2,
+	// Want the directory structure created so cAdvisor (and other
+	// inotify-based tools) can discover the subcontainer, and the limit
+	// files populated from the OCI resources so cAdvisor's
+	// container_spec_* series report real values. The compat cgroup is
+	// process-less, so these limits have no kernel-side accounting effect;
+	// they exist solely for cAdvisor compatibility. On systemd v2,
 	// Install({}) is a no-op for directory creation -- the dir is otherwise
 	// only created in Join() via StartTransientUnit, which would
 	// inappropriately register a process-less unit for compat purposes.
 	// InstallSubcontainerCompatDir handles that case while preserving the
 	// existing cgroupfs (v1 / non-systemd v2) behavior.
-	if err := cgroup.InstallSubcontainerCompatDir(cg); err != nil {
+	if err := cgroup.InstallSubcontainerCompatDir(cg, spec.Linux.Resources); err != nil {
 		switch {
 		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
 			log.Warningf("Skipping subcontainer cgroup configuration in rootless mode: %v", err)

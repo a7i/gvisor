@@ -29,9 +29,19 @@ import (
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 )
+
+// compatDirControllers are the v2 controllers populated on the compat cgroup
+// directory created by installCompatDir for cAdvisor's container_spec_*
+// series. Limited to controllers whose interface files cAdvisor reads as
+// spec values (memory.max, cpu.max / cpu.weight, pids.max). Other controllers
+// (cpuset, io, hugetlb) are intentionally excluded: they don't surface as
+// container_spec_* and writing them widens the failure surface on hosts where
+// they aren't enabled in the parent slice's cgroup.subtree_control.
+var compatDirControllers = []string{"cpu", "memory", "pids"}
 
 var (
 	// ErrBadResourceSpec indicates that a cgroupSystemd function was
@@ -94,7 +104,10 @@ func newCgroupV2Systemd(cgv2 *cgroupV2) (*cgroupSystemd, error) {
 
 // installCompatDir creates the cgroup directory under the parent slice
 // without registering a transient systemd unit, and tracks it in c.Own so
-// the embedded cgroupV2.Uninstall removes it at container destroy.
+// the embedded cgroupV2.Uninstall removes it at container destroy. When res
+// is non-nil, it also writes the cgroup interface files cAdvisor reads as
+// container_spec_* (memory.max, cpu.max, cpu.weight, pids.max) on a
+// best-effort basis.
 //
 // This exists so tools that discover containers via inotify on
 // /sys/fs/cgroup (notably cAdvisor) can see subcontainers that run inside a
@@ -103,20 +116,58 @@ func newCgroupV2Systemd(cgv2 *cgroupV2) (*cgroupSystemd, error) {
 // is otherwise created by Join() via StartTransientUnit, which would
 // inappropriately register a process-less unit for compat purposes.
 //
-// Callers should use this in place of Install(empty resources) when they
-// only need the host-side cgroup directory to exist for compatibility.
-func (c *cgroupSystemd) installCompatDir() error {
+// Callers should use this in place of Install(...) when they only need the
+// host-side cgroup directory to exist (and optionally its spec files
+// populated) for compatibility.
+func (c *cgroupSystemd) installCompatDir(res *specs.LinuxResources) error {
 	path := c.MakePath("")
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return fmt.Errorf("creating compat cgroup dir %q: %w", path, err)
 	}
+	alreadyTracked := false
 	for _, owned := range c.Own {
 		if owned == path {
-			return nil
+			alreadyTracked = true
+			break
 		}
 	}
-	c.Own = append(c.Own, path)
+	if !alreadyTracked {
+		c.Own = append(c.Own, path)
+	}
+
+	// Best-effort spec-file population. Controllers that aren't enabled in
+	// the parent slice's cgroup.subtree_control don't have leaf interface
+	// files; setValue then returns ENOENT, which we swallow. The compat dir
+	// must always succeed at directory level (#6657 precedent: the compat
+	// path must never block container start).
+	if res == nil {
+		return nil
+	}
+	for _, name := range compatDirControllers {
+		ctrlr, ok := controllers2[name]
+		if !ok {
+			continue
+		}
+		if err := ctrlr.set(res, path); err != nil {
+			if isCompatDirIgnorableErr(err) {
+				log.Debugf("Skipping %q spec-file population for compat cgroup %q: %v", name, path, err)
+				continue
+			}
+			return fmt.Errorf("populating %q spec files for compat cgroup %q: %w", name, path, err)
+		}
+	}
 	return nil
+}
+
+// isCompatDirIgnorableErr reports whether err from a best-effort spec-file
+// write on the compat cgroup is safe to swallow. The interface file may not
+// exist (controller not in subtree_control), the cgroup mount may be
+// read-only (sandboxed environments), or we may lack permission (rootless,
+// restricted user namespace). None of these should block container start.
+func isCompatDirIgnorableErr(err error) bool {
+	return errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, unix.EROFS)
 }
 
 // Install configures the properties for a scope unit but does not start the

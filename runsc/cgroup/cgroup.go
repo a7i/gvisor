@@ -430,20 +430,30 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 	return cg, nil
 }
 
-// InstallSubcontainerCompatDir creates an empty cgroup directory at the path
+// InstallSubcontainerCompatDir creates a cgroup directory at the path
 // resolved by cg, intended for cAdvisor (and other inotify-based) discovery
-// of subcontainers running inside a gVisor sandbox. The directory is tracked
-// by cg so that cg.Uninstall() removes it at container destroy.
+// of subcontainers running inside a gVisor sandbox. When res is non-nil, the
+// limit/spec interface files cAdvisor reads as container_spec_* (memory.max,
+// cpu.max, cpu.weight, pids.max, ...) are populated from it on a best-effort
+// basis. The directory is tracked by cg so that cg.Uninstall() removes it at
+// container destroy.
 //
 // On systemd v2, this bypasses the dbus StartTransientUnit path: a
 // process-less transient unit is not necessary for inotify discovery and
 // causes lifecycle conflicts with systemd. On cgroupfs (v1 or non-systemd v2),
-// this delegates to Install({}) which already mkdirs the directory.
-func InstallSubcontainerCompatDir(cg Cgroup) error {
+// this delegates to Install(res) which already mkdirs the directory and
+// writes spec files via the per-controller set() methods.
+//
+// The compat cgroup is intentionally process-less, so any limits written here
+// have no kernel-side accounting effect; they exist solely so cAdvisor's
+// container_spec_* series are populated for runsc pods, matching what runc
+// produces. Runtime counter series (container_*_total) remain zero by design;
+// see #13067.
+func InstallSubcontainerCompatDir(cg Cgroup, res *specs.LinuxResources) error {
 	if sd, ok := cg.(*cgroupSystemd); ok {
-		return sd.installCompatDir()
+		return sd.installCompatDir(res)
 	}
-	return cg.Install(&specs.LinuxResources{})
+	return cg.Install(res)
 }
 
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
