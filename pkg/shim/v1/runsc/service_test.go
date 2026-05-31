@@ -32,6 +32,40 @@ func TestContainerUpdateNilResources(t *testing.T) {
 	}
 }
 
+func TestStripGVisorCheckpointAnnotations(t *testing.T) {
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			CheckpointHostPathAnnotation:  "/var/lib/criu-dumps/runsc-test",
+			CheckpointDirectAnnotation:    "true",
+			"dev.gvisor.checkpoint.extra": "ignored",
+			utils.ContainerTypeAnnotation: "sandbox",
+			"dev.gvisor.keep":             "yes",
+			"example.com/annotation":      "kept",
+		},
+	}
+
+	stripGVisorCheckpointAnnotations(spec)
+
+	for _, key := range []string{
+		CheckpointHostPathAnnotation,
+		CheckpointDirectAnnotation,
+		"dev.gvisor.checkpoint.extra",
+	} {
+		if _, ok := spec.Annotations[key]; ok {
+			t.Errorf("stripGVisorCheckpointAnnotations kept %q", key)
+		}
+	}
+	for key, want := range map[string]string{
+		utils.ContainerTypeAnnotation: "sandbox",
+		"dev.gvisor.keep":             "yes",
+		"example.com/annotation":      "kept",
+	} {
+		if got := spec.Annotations[key]; got != want {
+			t.Errorf("stripGVisorCheckpointAnnotations annotation %q = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestCgroupPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string

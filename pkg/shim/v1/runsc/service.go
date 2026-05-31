@@ -184,13 +184,61 @@ func (s *runscService) Create(ctx context.Context, r *task.CreateTaskRequest) (*
 
 // CreateWithFSRestore is the same as Create, but it additionally restores the
 // container's filesystem from a snapshot.
+// CheckpointHostPathAnnotation, when set on the OCI runtime spec, makes
+// the shim dispatch the next Start RPC to runsc restore instead of runsc start.
+// Value is an absolute host path containing pages.img/checkpoint.img.
+const (
+	CheckpointHostPathAnnotation = "dev.gvisor.checkpoint.host-image-path"
+	CheckpointDirectAnnotation   = "dev.gvisor.checkpoint.direct"
+)
+
+func stripGVisorCheckpointAnnotations(spec *specs.Spec) {
+	if spec == nil || len(spec.Annotations) == 0 {
+		return
+	}
+	for k := range spec.Annotations {
+		if strings.HasPrefix(k, "dev.gvisor.checkpoint.") {
+			delete(spec.Annotations, k)
+		}
+	}
+}
+
 func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	spec, specErr := utils.ReadSpec(rfs.Create.Bundle)
+	var (
+		ctype           string
+		restoreHostPath string
+		restoreDirect   bool
+	)
+	if specErr == nil && spec != nil {
+		ctype = spec.Annotations["io.kubernetes.cri.container-type"]
+		if p, ok := spec.Annotations[CheckpointHostPathAnnotation]; ok && p != "" {
+			restoreHostPath = p
+		}
+		restoreDirect = spec.Annotations[CheckpointDirectAnnotation] == "true"
+		stripGVisorCheckpointAnnotations(spec)
+		if err := utils.WriteSpec(rfs.Create.Bundle, spec); err != nil {
+			return nil, fmt.Errorf("write stripped checkpoint annotations: %w", err)
+		}
+	}
+
 	c, err := NewContainer(ctx, s.platform, rfs.Create, rfs.Conf.ImagePath, rfs.Conf.Direct)
 	if err != nil {
 		return nil, err
+	}
+
+	// Detect gVisor checkpoint annotations in OCI spec. host-image-path points
+	// at files on the node and applies to the pod sandbox too, letting kubelet
+	// start the sandbox via runsc restore; subsequent workload starts are
+	// translated by runsc into subcontainer restores while the sandbox is in
+	// restoringUnstarted.
+	if specErr == nil && spec != nil && restoreHostPath != "" {
+		c.restoreHostImagePath = restoreHostPath
+		c.restoreDirect = restoreDirect
+		log.L.Debugf("Container %s flagged for restore from host-image-path=%s (direct=%v, type=%s)", rfs.Create.ID, c.restoreHostImagePath, c.restoreDirect, ctype)
 	}
 
 	s.containers[rfs.Create.ID] = c
@@ -241,7 +289,23 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	if err != nil {
 		return nil, err
 	}
-	p, err := c.Start(ctx, r)
+	// A Start RPC for a container created with a gVisor checkpoint annotation
+	// is served as a restore: kubelet's CRI restore flow creates the container
+	// from a checkpoint image and issues the standard Start RPC, so the dispatch
+	// to runsc restore happens here rather than via the native Restore RPC.
+	var p extension.Process
+	if path, ok := c.pendingRestore(r.ExecID); ok {
+		log.L.Debugf("Start: dispatching to Restore (host-image-path=%s)", path)
+		p, err = c.Restore(ctx, &extension.RestoreRequest{
+			Start: r,
+			Conf: extension.RestoreConfig{
+				ImagePath: path,
+				Direct:    c.restoreDirect,
+			},
+		})
+	} else {
+		p, err = c.Start(ctx, r)
+	}
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -447,9 +511,31 @@ func (s *runscService) CloseIO(ctx context.Context, r *task.CloseIORequest) (*ty
 	return empty, nil
 }
 
-// Checkpoint checkpoints the container.
+// Checkpoint checkpoints the container by invoking `runsc checkpoint`
+// and writing the resulting images to r.Path. kubelet's CheckpointContainer
+// CRI flow (e.g. POST /checkpoint/<ns>/<pod>/<ctr>) routes here.
 func (s *runscService) Checkpoint(ctx context.Context, r *task.CheckpointTaskRequest) (*types.Empty, error) {
-	return empty, errdefs.ErrNotImplemented
+	c, err := s.getContainer(r.ID)
+	if err != nil {
+		return empty, err
+	}
+	if c.task == nil {
+		return empty, fmt.Errorf("container %s has no task", r.ID)
+	}
+	if r.Path == "" {
+		return empty, fmt.Errorf("checkpoint Path is empty")
+	}
+	if err := os.MkdirAll(r.Path, 0o755); err != nil {
+		return empty, fmt.Errorf("mkdir %s: %w", r.Path, err)
+	}
+	log.L.Debugf("Checkpoint: id=%s path=%s", r.ID, r.Path)
+	if err := c.task.Runtime().Checkpoint(ctx, r.ID, &runsccmd.CheckpointOpts{
+		ImagePath:    r.Path,
+		LeaveRunning: true,
+	}); err != nil {
+		return empty, fmt.Errorf("runsc checkpoint: %w", err)
+	}
+	return empty, nil
 }
 
 // Restore restores the container.

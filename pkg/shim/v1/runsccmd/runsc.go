@@ -291,6 +291,38 @@ func (r *Runsc) Restore(context context.Context, id string, cio runc.IO, opts *R
 	return r.start(context, cio, r.command(context, append(args, id)...))
 }
 
+// CheckpointOpts is a set of options to runsc.Checkpoint().
+type CheckpointOpts struct {
+	ImagePath    string
+	LeaveRunning bool
+}
+
+func (o *CheckpointOpts) args() []string {
+	var out []string
+	if o.ImagePath != "" {
+		out = append(out, fmt.Sprintf("--image-path=%s", o.ImagePath))
+	}
+	if o.LeaveRunning {
+		out = append(out, "--leave-running")
+	}
+	return out
+}
+
+// Checkpoint snapshots a running container to opts.ImagePath via
+// `runsc checkpoint`.
+func (r *Runsc) Checkpoint(context context.Context, id string, opts *CheckpointOpts) error {
+	args := []string{"checkpoint"}
+	if opts != nil {
+		args = append(args, opts.args()...)
+	}
+	args = append(args, id)
+	_, stderr, err := cmdOutput(r.command(context, args...), false)
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, stderr)
+	}
+	return nil
+}
+
 type waitResult struct {
 	ID         string `json:"id"`
 	ExitStatus int    `json:"exitStatus"`
