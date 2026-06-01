@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	cgroups "github.com/containerd/cgroups/v3"
@@ -79,6 +80,14 @@ type Container struct {
 
 	// restoreDirect controls runsc restore --direct.
 	restoreDirect bool
+
+	// saveRestoreExecArgv, if set, is passed to `runsc checkpoint
+	// --save-restore-exec-argv`: a hook runsc runs inside the sandbox before
+	// saving and after restoring. Sourced from a checkpoint annotation.
+	saveRestoreExecArgv string
+
+	// saveRestoreExecTimeout optionally bounds that hook.
+	saveRestoreExecTimeout time.Duration
 }
 
 // NewContainer returns a new runsc container

@@ -295,6 +295,17 @@ func (r *Runsc) Restore(context context.Context, id string, cio runc.IO, opts *R
 type CheckpointOpts struct {
 	ImagePath    string
 	LeaveRunning bool
+
+	// SaveRestoreExecArgv, if set, is the argv (split by spaces, argv[0] is the
+	// binary path) of a hook that runsc executes inside the sandbox before
+	// saving and after restoring. A non-zero exit fails the save/restore. The
+	// argv is baked into the checkpoint image, so restore runs it automatically
+	// without a corresponding restore-side flag.
+	SaveRestoreExecArgv string
+
+	// SaveRestoreExecTimeout bounds the save/restore hook. It is only emitted
+	// when SaveRestoreExecArgv is set.
+	SaveRestoreExecTimeout time.Duration
 }
 
 func (o *CheckpointOpts) args() []string {
@@ -304,6 +315,12 @@ func (o *CheckpointOpts) args() []string {
 	}
 	if o.LeaveRunning {
 		out = append(out, "--leave-running")
+	}
+	if o.SaveRestoreExecArgv != "" {
+		out = append(out, fmt.Sprintf("--save-restore-exec-argv=%s", o.SaveRestoreExecArgv))
+		if o.SaveRestoreExecTimeout > 0 {
+			out = append(out, fmt.Sprintf("--save-restore-exec-timeout=%s", o.SaveRestoreExecTimeout))
+		}
 	}
 	return out
 }

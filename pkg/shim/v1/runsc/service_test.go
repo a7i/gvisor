@@ -35,12 +35,14 @@ func TestContainerUpdateNilResources(t *testing.T) {
 func TestStripGVisorCheckpointAnnotations(t *testing.T) {
 	spec := &specs.Spec{
 		Annotations: map[string]string{
-			CheckpointHostPathAnnotation:  "/var/lib/criu-dumps/runsc-test",
-			CheckpointDirectAnnotation:    "true",
-			"dev.gvisor.checkpoint.extra": "ignored",
-			utils.ContainerTypeAnnotation: "sandbox",
-			"dev.gvisor.keep":             "yes",
-			"example.com/annotation":      "kept",
+			CheckpointHostPathAnnotation:               "/var/lib/criu-dumps/runsc-test",
+			CheckpointDirectAnnotation:                 "true",
+			CheckpointSaveRestoreExecArgvAnnotation:    "/usr/local/bin/gvisor-cuda-hook",
+			CheckpointSaveRestoreExecTimeoutAnnotation: "10m",
+			"dev.gvisor.checkpoint.extra":              "ignored",
+			utils.ContainerTypeAnnotation:              "sandbox",
+			"dev.gvisor.keep":                          "yes",
+			"example.com/annotation":                   "kept",
 		},
 	}
 
@@ -49,6 +51,8 @@ func TestStripGVisorCheckpointAnnotations(t *testing.T) {
 	for _, key := range []string{
 		CheckpointHostPathAnnotation,
 		CheckpointDirectAnnotation,
+		CheckpointSaveRestoreExecArgvAnnotation,
+		CheckpointSaveRestoreExecTimeoutAnnotation,
 		"dev.gvisor.checkpoint.extra",
 	} {
 		if _, ok := spec.Annotations[key]; ok {

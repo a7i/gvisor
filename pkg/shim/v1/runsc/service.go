@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	cgroups "github.com/containerd/cgroups/v3"
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
@@ -190,6 +191,15 @@ func (s *runscService) Create(ctx context.Context, r *task.CreateTaskRequest) (*
 const (
 	CheckpointHostPathAnnotation = "dev.gvisor.checkpoint.host-image-path"
 	CheckpointDirectAnnotation   = "dev.gvisor.checkpoint.direct"
+	// CheckpointSaveRestoreExecArgvAnnotation is passed to
+	// `runsc checkpoint --save-restore-exec-argv`: a hook runsc runs inside the
+	// sandbox before saving and after restoring (e.g. to checkpoint/restore GPU
+	// state). The argv is baked into the checkpoint image, so restore runs it
+	// automatically; only the checkpoint side needs the annotation.
+	CheckpointSaveRestoreExecArgvAnnotation = "dev.gvisor.checkpoint.save-restore-exec-argv"
+	// CheckpointSaveRestoreExecTimeoutAnnotation optionally bounds that hook; its
+	// value is a Go duration string (e.g. "10m"). Ignored without the argv.
+	CheckpointSaveRestoreExecTimeoutAnnotation = "dev.gvisor.checkpoint.save-restore-exec-timeout"
 )
 
 func stripGVisorCheckpointAnnotations(spec *specs.Spec) {
@@ -209,9 +219,11 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 
 	spec, specErr := utils.ReadSpec(rfs.Create.Bundle)
 	var (
-		ctype           string
-		restoreHostPath string
-		restoreDirect   bool
+		ctype                  string
+		restoreHostPath        string
+		restoreDirect          bool
+		saveRestoreExecArgv    string
+		saveRestoreExecTimeout time.Duration
 	)
 	if specErr == nil && spec != nil {
 		ctype = spec.Annotations["io.kubernetes.cri.container-type"]
@@ -219,6 +231,14 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 			restoreHostPath = p
 		}
 		restoreDirect = spec.Annotations[CheckpointDirectAnnotation] == "true"
+		saveRestoreExecArgv = spec.Annotations[CheckpointSaveRestoreExecArgvAnnotation]
+		if v := spec.Annotations[CheckpointSaveRestoreExecTimeoutAnnotation]; v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s=%q: %w", CheckpointSaveRestoreExecTimeoutAnnotation, v, err)
+			}
+			saveRestoreExecTimeout = d
+		}
 		stripGVisorCheckpointAnnotations(spec)
 		if err := utils.WriteSpec(rfs.Create.Bundle, spec); err != nil {
 			return nil, fmt.Errorf("write stripped checkpoint annotations: %w", err)
@@ -239,6 +259,14 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		c.restoreHostImagePath = restoreHostPath
 		c.restoreDirect = restoreDirect
 		log.L.Debugf("Container %s flagged for restore from host-image-path=%s (direct=%v, type=%s)", rfs.Create.ID, c.restoreHostImagePath, c.restoreDirect, ctype)
+	}
+	// The save/restore-exec hook applies to the checkpoint side and is
+	// independent of restore, so it is recorded for every container that sets
+	// it (not gated on host-image-path).
+	if saveRestoreExecArgv != "" {
+		c.saveRestoreExecArgv = saveRestoreExecArgv
+		c.saveRestoreExecTimeout = saveRestoreExecTimeout
+		log.L.Debugf("Container %s save/restore-exec hook: argv=%q timeout=%v", rfs.Create.ID, c.saveRestoreExecArgv, c.saveRestoreExecTimeout)
 	}
 
 	s.containers[rfs.Create.ID] = c
@@ -530,8 +558,10 @@ func (s *runscService) Checkpoint(ctx context.Context, r *task.CheckpointTaskReq
 	}
 	log.L.Debugf("Checkpoint: id=%s path=%s", r.ID, r.Path)
 	if err := c.task.Runtime().Checkpoint(ctx, r.ID, &runsccmd.CheckpointOpts{
-		ImagePath:    r.Path,
-		LeaveRunning: true,
+		ImagePath:              r.Path,
+		LeaveRunning:           true,
+		SaveRestoreExecArgv:    c.saveRestoreExecArgv,
+		SaveRestoreExecTimeout: c.saveRestoreExecTimeout,
 	}); err != nil {
 		return empty, fmt.Errorf("runsc checkpoint: %w", err)
 	}
