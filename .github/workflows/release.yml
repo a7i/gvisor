@@ -15,41 +15,45 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            bazel_config: ""
+            bazel_config: "--config=x86_64 --compilation_mode=opt"
+            runs-on: ubuntu-latest
+            want_elf: x86-64
           - arch: aarch64
-            bazel_config: "--config=aarch64"
-    runs-on: ubuntu-latest
+            bazel_config: "--config=aarch64 --compilation_mode=opt"
+            runs-on: ubuntu-24.04-arm
+            want_elf: ARM aarch64
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo -E apt-get update
-          sudo -E apt-get install -y make
+          sudo -E apt-get install -y make file
 
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Build runsc
+      - name: Build runsc and containerd-shim-runsc-v1
         run: |
           mkdir -p bin
-          make copy TARGETS="//runsc" OPTIONS="${{ matrix.bazel_config }}" DESTINATION=bin/
+          make BAZEL_OPTIONS="${{ matrix.bazel_config }}" copy TARGETS="//runsc:runsc" DESTINATION=bin/
+          make BAZEL_OPTIONS="${{ matrix.bazel_config }}" copy TARGETS="//shim:containerd-shim-runsc-v1" DESTINATION=bin/
           mv bin/runsc bin/runsc-${{ matrix.arch }}
-
-      - name: Build runsc-metric-server
-        run: |
-          make copy TARGETS="//runsc/cmd/metricserver:runsc-metric-server" OPTIONS="${{ matrix.bazel_config }}" DESTINATION=bin/
-          mv bin/runsc-metric-server bin/runsc-metric-server-${{ matrix.arch }}
-
-      - name: Build containerd-shim-runsc-v1
-        run: |
-          make copy TARGETS="//shim:containerd-shim-runsc-v1" OPTIONS="${{ matrix.bazel_config }}" DESTINATION=bin/
           mv bin/containerd-shim-runsc-v1 bin/containerd-shim-runsc-v1-${{ matrix.arch }}
+
+      - name: Verify binary architecture
+        run: |
+          file bin/runsc-${{ matrix.arch }} | grep -q "${{ matrix.want_elf }}"
+          file bin/containerd-shim-runsc-v1-${{ matrix.arch }} | grep -q "${{ matrix.want_elf }}"
+
+      - name: Verify runsc embeds metric-server subcommand
+        run: |
+          bin/runsc-${{ matrix.arch }} help 2>&1 | grep -q metric-server
 
       - name: Generate SHA512 checksums
         working-directory: bin
         run: |
           sha512sum runsc-${{ matrix.arch }} > runsc.sha512-${{ matrix.arch }}
-          sha512sum runsc-metric-server-${{ matrix.arch }} > runsc-metric-server.sha512-${{ matrix.arch }}
           sha512sum containerd-shim-runsc-v1-${{ matrix.arch }} > containerd-shim-runsc-v1.sha512-${{ matrix.arch }}
 
       - name: Upload artifacts
